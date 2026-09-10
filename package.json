@@ -1,0 +1,30 @@
+{
+  "name": "distops-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DistOps backend — Express + MySQL، يحل محل Supabase (Auth + RLS + Storage + Realtime + RPC + Cron)",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "migrate-data": "node migrate-data.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.11.0",
+    "node-cron": "^3.0.3",
+    "pg": "^8.13.0",
+    "puppeteer": "^24.43.1",
+    "web-push": "^3.6.7",
+    "ws": "^8.18.0",
+    "xlsx": "^0.18.5"
+  }
+}
