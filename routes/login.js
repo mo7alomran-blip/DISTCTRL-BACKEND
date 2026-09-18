@@ -107,7 +107,7 @@ router.post("/refresh", async (req, res) => {
 // عكس routes/users-admin.js اللي يغيّر كلمة مرور شخص آخر ويحتاج صلاحية إدارية)
 router.post("/auth/update-password", requireAuth, async (req, res) => {
   const { password } = req.body || {};
-  if (!password || password.length < 4) return res.status(400).json({ error: "invalid_input" });
+  if (!password || password.length < 8) return res.status(400).json({ error: "invalid_input" });
   try {
     const passwordHash = await hashPassword(password);
     await pool.query("UPDATE users SET password_hash = ? WHERE id = ?", [passwordHash, req.authUserId]);

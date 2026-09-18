@@ -10,10 +10,12 @@ import webpush from "web-push";
 import * as XLSX from "xlsx";
 import { pool } from "./db.js";
 import { sendDailyReport, sendPeriodicReport } from "./reportEmails.js";
-import { notifyJobDelayed } from "./jobNotifications.js";
+import { notifyJobDelayed, notifyJobDueToday } from "./jobNotifications.js";
 import { sendWebPushToSubs } from "./pushSend.js";
 import { getWhatsAppLiveStatus, startWhatsAppSession, isWhatsAppConfigured } from "./whatsapp.js";
 import { recordHealthCheck } from "./systemHealth.js";
+import { todayKsaISO } from "./ksaTime.js";
+import { OWNER_EMPLOYEE_ID } from "./scope.js";
 import "dotenv/config";
 
 webpush.setVapidDetails(
@@ -26,17 +28,24 @@ webpush.setVapidDetails(
 // لأن scheduled_jobs ما فيها section_id إطلاقًا بالأساس) ──
 async function getResponsibleAdminIds(warehouseId, assignments, users, warehouses) {
   const assignedUserIds = new Set(assignments.map((a) => a.user_id));
-  const openAdmins = () => users.filter((u) => ["admin", "manager", "operator"].includes(u.role) && !assignedUserIds.has(u.id)).map((u) => u.id);
+  const openAdmins = () => users.filter((u) => ["admin", "section_head", "manager", "operator"].includes(u.role) && !assignedUserIds.has(u.id)).map((u) => u.id);
   if (!warehouseId) return openAdmins();
   const division = warehouses.find((w) => w.id === warehouseId)?.division_id ?? null;
   const warehouseAssignments = assignments.filter((a) => a.warehouse_id === warehouseId && !a.section_id && !a.division_id);
   const divisionAssignments = assignments.filter((a) => a.division_id && a.division_id === division);
-  const specific = new Set([...warehouseAssignments, ...divisionAssignments].map((a) => a.user_id));
-  return specific.size > 0 ? [...specific] : openAdmins();
+  // أولوية للأخص — مستودع محدد يطغى على مدير الدائرة الكاملة (نفس إصلاح resolveResponsibleAdminPhones
+  // بـjobNotifications.js يوم 2026-09-11، انظر تعليقها فيه للتفصيل الكامل). لو التخصيص الدقيق موجود لكن
+  // ما طابق أي مشرف حقيقي (تخصيص خاطئ لموظف عادي مثلاً) نتصعّد بدل ما نرجّع فاضي بصمت — نفس الإصلاح.
+  const adminRoleIds = new Set(users.filter((u) => ["admin", "section_head", "manager", "operator"].includes(u.role)).map((u) => u.id));
+  const warehouseIds = [...new Set(warehouseAssignments.map((a) => a.user_id))].filter((id) => adminRoleIds.has(id));
+  if (warehouseIds.length > 0) return warehouseIds;
+  const divisionIds = [...new Set(divisionAssignments.map((a) => a.user_id))].filter((id) => adminRoleIds.has(id));
+  if (divisionIds.length > 0) return divisionIds;
+  return openAdmins();
 }
 
 export async function checkOverdueJobs() {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayKsaISO(); // بتوقيت السعودية — UTC كان يعطي تاريخ يوم سابق بين 00:00-03:00 محليًا
   const [jobs] = await pool.query(
     `SELECT id, title, warehouse_id, scheduled_date FROM scheduled_jobs
      WHERE status = 'in_progress' AND job_received_at IS NULL
@@ -47,7 +56,8 @@ export async function checkOverdueJobs() {
 
   const [[assignments], [users], [warehouses], [subs]] = await Promise.all([
     pool.query("SELECT * FROM warehouse_assignments"),
-    pool.query("SELECT id, role FROM users"),
+    // المالك مستثنى دائمًا — نفس إصلاح resolveResponsibleAdminPhones بـjobNotifications.js 2026-09-13
+    pool.query("SELECT id, role FROM users WHERE employee_id <> ?", [OWNER_EMPLOYEE_ID]),
     pool.query("SELECT id, division_id FROM warehouses"),
     pool.query("SELECT id, user_id, endpoint, p256dh, auth_key FROM push_subscriptions"),
   ]);
@@ -85,6 +95,25 @@ export async function checkDelayedJobs() {
       await pool.query("UPDATE scheduled_jobs SET overdue_alert_sent_at = NOW() WHERE id = ?", [job.id]);
     } catch (e) {
       console.error("checkDelayedJobs notify failed for", job.id, ":", e.message || e);
+    }
+  }
+  return { success: true, checked: jobs.length };
+}
+
+// ── checkTodayJobs: تذكير صباحي بكل عمل مجدول لنفس اليوم (طلب صريح من المالك 2026-09-11) — يوصل الموظف
+// المسند إليه العمل مباشرة + المشرف المسؤول عن النطاق معًا، لكل عمل لسه شغّال (مو مكتمل/ملغى). كل عمل
+// يُذكَّر به مرة وحدة بالضبط (يوم scheduled_date نفسه فقط — ما يتكرر باليوم اللي بعده حتى لو لسه مو مكتمل) ──
+export async function checkTodayJobs() {
+  const today = todayKsaISO();
+  const [jobs] = await pool.query(
+    "SELECT * FROM scheduled_jobs WHERE scheduled_date = ? AND status NOT IN ('completed','cancelled')",
+    [today]
+  );
+  for (const job of jobs) {
+    try {
+      await notifyJobDueToday(job);
+    } catch (e) {
+      console.error("checkTodayJobs notify failed for", job.id, ":", e.message || e);
     }
   }
   return { success: true, checked: jobs.length };
@@ -144,7 +173,7 @@ export async function dailyBackup() {
     XLSX.utils.book_append_sheet(workbook, sheet, t.name.slice(0, 31));
   }
 
-  const todayShort = new Date().toISOString().slice(0, 10);
+  const todayShort = todayKsaISO(); // بتوقيت السعودية — نفس سبب checkOverdueJobs فوق
   const fileName = `backup-${todayShort}.xlsx`;
   const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
 
@@ -247,11 +276,29 @@ async function loadReportSchedulesAndStart() {
   }
 }
 
+// وحدة "التشغيل" — إرسال رسائل التشغيل المجدولة (المشرف يختار وقت إرسال لاحق وقت الاستيراد من إكسل،
+// بدل الإرسال الفوري). نمسح scheduled_send_at فورًا قبل محاولة الإرسال (نجاح أو فشل) حتى ما تُعاد
+// المحاولة كل دقيقة للأبد لو فشلت — نفس مبدأ "لا تفقد سجل التشغيل" (فشل الإرسال مسجَّل بحاله وقابل لإعادة الإرسال يدويًا)
+async function checkScheduledOperationMessages() {
+  const [rows] = await pool.query(
+    "SELECT * FROM operations WHERE scheduled_send_at IS NOT NULL AND scheduled_send_at <= UTC_TIMESTAMP(3) AND message_status != 'sent'"
+  );
+  if (!rows.length) return { success: true, checked: 0 };
+  const { sendOperationMessage } = await import("./operationsWhatsapp.js");
+  for (const op of rows) {
+    await pool.query("UPDATE operations SET scheduled_send_at = NULL WHERE id = ?", [op.id]);
+    await sendOperationMessage(op, null).catch((e) => console.error("scheduled sendOperationMessage failed:", e.message || e));
+  }
+  return { success: true, checked: rows.length };
+}
+
 export function startCronJobs() {
   cron.schedule("0 5 * * *", () => checkOverdueJobs().catch((e) => console.error("checkOverdueJobs failed:", e)), { timezone: "UTC" });
   cron.schedule("0 2 * * *", () => dailyBackup().catch((e) => console.error("dailyBackup failed:", e)), { timezone: "UTC" });
   cron.schedule("*/15 * * * *", () => checkDelayedJobs().catch((e) => console.error("checkDelayedJobs failed:", e)), { timezone: "UTC" });
   cron.schedule("*/15 * * * *", () => checkWhatsAppHealth().catch((e) => console.error("checkWhatsAppHealth failed:", e)), { timezone: "UTC" });
+  cron.schedule("0 3 * * *", () => checkTodayJobs().catch((e) => console.error("checkTodayJobs failed:", e)), { timezone: "UTC" }); // 06:00 بتوقيت السعودية
+  cron.schedule("* * * * *", () => checkScheduledOperationMessages().catch((e) => console.error("checkScheduledOperationMessages failed:", e)), { timezone: "UTC" });
   loadReportSchedulesAndStart().catch((e) => console.error("loadReportSchedulesAndStart failed:", e));
-  console.log("Cron jobs started: check-overdue-jobs (05:00 UTC), daily-backup (02:00 UTC), check-delayed-jobs (كل 15 دقيقة), check-whatsapp-health (كل 15 دقيقة), report-* (من report_schedules)");
+  console.log("Cron jobs started: check-overdue-jobs (05:00 UTC), daily-backup (02:00 UTC), check-delayed-jobs (كل 15 دقيقة), check-whatsapp-health (كل 15 دقيقة), check-today-jobs (03:00 UTC = 06:00 السعودية), check-scheduled-operation-messages (كل دقيقة), report-* (من report_schedules)");
 }

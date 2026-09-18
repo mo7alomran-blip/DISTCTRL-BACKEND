@@ -25,7 +25,9 @@ import usersAdminRouter from "./routes/users-admin.js";
 import reportsRouter from "./routes/reports.js";
 import pushRouter from "./routes/push.js";
 import jobActionsRouter from "./routes/jobActions.js";
+import equipmentReplacementsRouter from "./routes/equipmentReplacements.js";
 import violationActionsRouter from "./routes/violationActions.js";
+import operationsRouter from "./routes/operations.js";
 import { router as storageRouter, mountPublicBuckets } from "./storage.js";
 import { initRealtime } from "./realtime.js";
 import { startCronJobs } from "./cron.js";
@@ -36,6 +38,12 @@ const app = express();
 
 // FRONTEND_ORIGIN يقبل قيمة وحيدة أو عدة قيم مفصولة بفواصل (مهم لما يكون عندنا أكثر من دومين
 // يشاور لنفس الباك اند — مثلاً رابط Vercel + الدومين المخصص + www)
+// إصلاح أمني (فحص أمني 2026-09-18): كان .env ناقص/فاضي لهذا المتغيّر يفتح CORS لأي أصل بصمت تام —
+// طبقة حماية إضافية تختفي بدون أي تنبيه. الآن يظهر تحذير صريح بالسجلات (بدون إيقاف السيرفر — احتياطًا
+// لأي بيئة اختبار قديمة تعتمد على السلوك الافتراضي عمدًا) حتى ما يفوت هذا الإعداد على أحد.
+if (!process.env.FRONTEND_ORIGIN) {
+  console.warn("⚠️  FRONTEND_ORIGIN غير مضبوط بـ.env — CORS مفتوح لأي أصل (*). اضبطه بدومين الفرونت اند الحقيقي.");
+}
 const allowedOrigins = (process.env.FRONTEND_ORIGIN || "*").split(",").map((o) => o.trim()).filter(Boolean);
 app.use(cors({
   origin: allowedOrigins.includes("*") ? "*" : allowedOrigins,
@@ -55,7 +63,9 @@ app.use("/api", storageRouter);
 app.use("/api", reportsRouter);
 app.use("/api", pushRouter);
 app.use("/api", jobActionsRouter);
+app.use("/api", equipmentReplacementsRouter);
 app.use("/api", violationActionsRouter);
+app.use("/api", operationsRouter);
 mountPublicBuckets(app);
 
 // يقابل supabase.rpc(name, params) — نفس أسماء الدوال الست بالضبط، حتى طبقة التوافق بالفرونت

@@ -132,3 +132,56 @@ export async function startWhatsAppSession() {
   if (!cfg) return { success: false, error: "not_configured" };
   return callApi(`/api/sessions/${cfg.sessionId}/start`, { method: "POST" });
 }
+
+// إرسال عبر البوت الاحتياطي الذاتي الاستضافة (distctrl-whatsapp-bot، Baileys) بدل Hermosa — مطلوب خصوصًا
+// لقروبات واتساب: Hermosa وسيلة الإرسال الرئيسية مرتبطة برقم غير عضو بقروبات العمل الفعلية، بينما البوت
+// الاحتياطي (رقم منفصل) عضو فيها فعلاً. انظر resolveJobTargets/broadcastToJob بـjobNotifications.js —
+// أي هدف إرسال شكله معرّف قروب (ينتهي بـ@g.us) يُوجَّه هنا تلقائيًا بدل sendWhatsAppText العادي.
+function backupBotConfig() {
+  const url = process.env.BACKUP_BOT_URL;
+  const apiKey = process.env.BACKUP_BOT_API_KEY;
+  if (!url || !apiKey) return null;
+  return { url: url.replace(/\/$/, ""), apiKey };
+}
+
+export function isBackupBotConfigured() {
+  return !!backupBotConfig();
+}
+
+export async function sendViaBackupBot(to, message) {
+  const cfg = backupBotConfig();
+  if (!cfg) return { success: false, error: "not_configured" };
+  try {
+    const res = await fetch(`${cfg.url}/send`, {
+      method: "POST",
+      headers: { "x-api-key": cfg.apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ to, message }),
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return { success: false, error: body?.error || `http_${res.status}`, status: res.status };
+    return { success: true, data: body };
+  } catch (err) {
+    return { success: false, error: String(err.message || err) };
+  }
+}
+
+// مرفق (PDF غالبًا) عبر البوت الاحتياطي — لازم للقروبات تحديدًا: Hermosa (sendWhatsAppMediaUrl) وسيلة
+// الإرسال الرئيسية، بس رقمها مو عضو بقروبات العمل الفعلية، فأي مرفق موجَّه لقروب يفشل بصمت عبرها.
+// انظر sendJobCompletionPdf/sendQualityPdf/sendEquipmentReplacementPdf بـjobNotifications.js — أي هدف
+// شكله معرّف قروب (@g.us) يُوجَّه هنا بدل sendWhatsAppMediaUrl، بنفس فكرة isGroupJid بالرسائل النصية.
+export async function sendMediaViaBackupBot(to, mediaUrl, caption, filename) {
+  const cfg = backupBotConfig();
+  if (!cfg) return { success: false, error: "not_configured" };
+  try {
+    const res = await fetch(`${cfg.url}/send-media`, {
+      method: "POST",
+      headers: { "x-api-key": cfg.apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ to, mediaUrl, caption, filename }),
+    });
+    const body = await res.json().catch(() => null);
+    if (!res.ok) return { success: false, error: body?.error || `http_${res.status}`, status: res.status };
+    return { success: true, data: body };
+  } catch (err) {
+    return { success: false, error: String(err.message || err) };
+  }
+}

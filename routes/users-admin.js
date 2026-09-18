@@ -37,9 +37,23 @@ async function tryNotifyCredentialsViaWhatsApp(userId, plainPassword) {
   if (!isWhatsAppConfigured()) return { sent: false, reason: "not_configured" };
   const [[u]] = await pool.query("SELECT name, employee_id, phone FROM users WHERE id = ?", [userId]);
   if (!u?.phone) return { sent: false, reason: "no_phone" };
+  // رابط التطبيق كان ناقص من هذي الرسالة (خلل حقيقي بلّغ عنه المالك 2026-09-11: عمر السلمي استلم بيانات
+  // الدخول بدون أي رابط يفتح منه التطبيق أصلًا) — أُضيف هنا، وينطبق تلقائيًا على كل مسارات الدعوة الثلاثة
+  // (set-password / grant-login / broadcast) لأنها كلها تمر من هذي الدالة نفسها.
+  // ثنائية اللغة (عربي فوق / إنجليزي تحت بنفس الرسالة) — طلب صريح من المالك 2026-09-11 عشان تصلح
+  // لأي موظف بغض النظر عن لغته، بدل ما يحتاج المشرف يختار لغة الرسالة يدويًا في كل مرة.
+  // طريقة تغيير كلمة المرور اتغيّرت بالواجهة (2026-09-11): زر القفل 🔒 المستقل صار داخل قائمة "⋮" المنسدلة
+  // أعلى الشاشة، مو ظاهر مباشرة زي قبل — لازم تحديث نص هالتعليمة كل ما تتغيّر الواجهة، هذا مكانها الوحيد.
+  const appUrl = process.env.APP_URL || "https://distctrl.com";
   const text = `مرحبًا ${u.name} 👋\nتم تحديث بيانات دخولك بنظام DistCtrl:\n\n` +
+    `🔗 الرابط: ${appUrl}\n` +
     `🔢 الرقم الوظيفي: ${u.employee_id}\n🔑 كلمة المرور: ${plainPassword}\n\n` +
-    `يُفضّل تغييرها من داخل التطبيق بعد أول دخول (القفل 🔒 أعلى الشاشة).`;
+    `يُفضّل تغييرها من داخل التطبيق بعد أول دخول (اضغط ⋮ أعلى الشاشة ثم "تغيير كلمة المرور").\n\n` +
+    `────────────\n\n` +
+    `Hello ${u.name} 👋\nYour DistCtrl login details have been updated:\n\n` +
+    `🔗 Link: ${appUrl}\n` +
+    `🔢 Employee ID: ${u.employee_id}\n🔑 Password: ${plainPassword}\n\n` +
+    `Please change it from inside the app after your first login (tap ⋮ at the top, then "Change Password").`;
   const result = await sendWhatsAppText(u.phone, text);
   return { sent: !!result.success, reason: result.success ? undefined : result.error };
 }
@@ -49,7 +63,7 @@ async function requireActiveAdmin(req, res) {
     "SELECT id, role, is_active, employee_id FROM users WHERE id = ?",
     [req.authUserId]
   );
-  if (!caller || caller.role !== "admin" || !caller.is_active) {
+  if (!caller || !["admin", "section_head"].includes(caller.role) || !caller.is_active) {
     res.status(403).json({ success: false, error: "forbidden" });
     return null;
   }
@@ -63,13 +77,13 @@ router.post("/admin/users", requireAuth, async (req, res) => {
     if (!caller) return;
 
     const { name, employee_id, password, role, warehouse_id, phone } = req.body || {};
-    if (!name || !employee_id || !password || password.length < 4) {
+    if (!name || !employee_id || !password || password.length < 8) {
       return res.status(400).json({ success: false, error: "invalid_input" });
     }
     if (employee_id === OWNER_EMPLOYEE_ID) return res.status(400).json({ success: false, error: "reserved_id" });
 
     const isOwner = caller.employee_id === OWNER_EMPLOYEE_ID;
-    const finalRole = ["admin", "manager", "operator"].includes(role) ? role : "user";
+    const finalRole = ["admin", "section_head", "manager", "operator"].includes(role) ? role : "user";
 
     let finalWarehouseId = null;
     let adminAssignmentWarehouseId = null;
@@ -164,7 +178,7 @@ router.post("/admin/set-password", requireAuth, async (req, res) => {
     if (!caller) return;
 
     const { target_employee_id, new_password, send_whatsapp } = req.body || {};
-    if (!target_employee_id || !new_password || new_password.length < 4) {
+    if (!target_employee_id || !new_password || new_password.length < 8) {
       return res.status(400).json({ success: false, error: "invalid_input" });
     }
     if (target_employee_id === OWNER_EMPLOYEE_ID) return res.status(403).json({ success: false, error: "forbidden" });
@@ -201,7 +215,7 @@ router.post("/admin/grant-login", requireAuth, async (req, res) => {
     if (!caller) return;
 
     const { target_employee_id, password, send_whatsapp } = req.body || {};
-    if (!target_employee_id || !password || password.length < 4) {
+    if (!target_employee_id || !password || password.length < 8) {
       return res.status(400).json({ success: false, error: "invalid_input" });
     }
 
@@ -239,7 +253,7 @@ router.post("/admin/broadcast-password-whatsapp", requireAuth, async (req, res) 
     if (caller.employee_id !== OWNER_EMPLOYEE_ID) return res.status(403).json({ success: false, error: "owner_only" });
 
     const { password } = req.body || {};
-    if (!password || password.length < 4) return res.status(400).json({ success: false, error: "invalid_input" });
+    if (!password || password.length < 8) return res.status(400).json({ success: false, error: "invalid_input" });
     if (!isWhatsAppConfigured()) return res.status(400).json({ success: false, error: "whatsapp_not_configured" });
 
     const [targets] = await pool.query(

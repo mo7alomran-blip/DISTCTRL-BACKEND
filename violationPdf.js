@@ -3,12 +3,9 @@
 // صورها، ثم التوقيعات) — نفس أسلوب jobPdf.js بالضبط (Puppeteer، بدون حيلة arabicImgTag).
 import { pool } from "./db.js";
 import { VIOLATION_TYPES } from "./violationTypes.js";
+import { fmtKsaDate } from "./ksaTime.js";
 
-function fmtDate(d) {
-  if (!d) return "—";
-  const dt = new Date(d);
-  return `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()}`;
-}
+const fmtDate = fmtKsaDate; // بتوقيت السعودية دايمًا — انظر تعليق ksaTime.js
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }

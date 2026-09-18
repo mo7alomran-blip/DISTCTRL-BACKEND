@@ -4,28 +4,15 @@
 import { pool } from "./db.js";
 import "dotenv/config";
 import { sendWhatsAppText, isWhatsAppConfigured } from "./whatsapp.js";
+import { fmtKsaDateTime, fmtKsaDate, todayKsaShort } from "./ksaTime.js";
 
 const OVERDUE_DAYS = 2;
 
-function fmtDate(d) {
-  if (!d) return "—";
-  const dt = new Date(d);
-  const day = String(dt.getDate()).padStart(2, "0");
-  const mon = String(dt.getMonth() + 1).padStart(2, "0");
-  const year = dt.getFullYear();
-  const hr = String(dt.getHours()).padStart(2, "0");
-  const min = String(dt.getMinutes()).padStart(2, "0");
-  return `${day}/${mon}/${year} - ${hr}:${min}`;
-}
-function fmtDateShort(d) {
-  if (!d) return "—";
-  const dt = new Date(d);
-  return `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()}`;
-}
-function todayShort() {
-  const d = new Date();
-  return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
-}
+// بتوقيت السعودية دايمًا — انظر تعليق ksaTime.js (خلل حقيقي كان يعرض توقيت UTC الخام، بلّغ عنه المستخدم
+// يوم 2026-09-11 عبر رسالة واتساب تنبيه تأخير)
+const fmtDate = fmtKsaDateTime;
+const fmtDateShort = fmtKsaDate;
+const todayShort = todayKsaShort;
 function orderRef(o) {
   return o?.order_no ? `#${o.order_no}` : "—";
 }

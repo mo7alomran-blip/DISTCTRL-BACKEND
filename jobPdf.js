@@ -3,12 +3,9 @@
 // العربي RTL صح بشكل أصلي عبر CSS مباشرة، فما نحتاج حيلة arabicImgTag (تحويل كل نص لصورة) اللي
 // يستخدمها الفرونت أصلاً بسبب قصور html2canvas مع تشكيل الحروف العربية.
 import { pool } from "./db.js";
+import { fmtKsaDateTime } from "./ksaTime.js";
 
-function fmtDateTime(d) {
-  if (!d) return "—";
-  const dt = new Date(d);
-  return `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()} - ${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`;
-}
+const fmtDateTime = fmtKsaDateTime; // بتوقيت السعودية دايمًا — انظر تعليق ksaTime.js
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -240,6 +237,82 @@ export async function generateJobPermitsPdfBuffer(jobId) {
       <tr><td>عدد الصور</td><td>${urls.length}</td></tr>
     </table>
     <div class="photo-grid">${urls.map((u) => `<img src="${esc(u)}"/>`).join("") || '<div class="empty">لا توجد صور</div>'}</div>
+  </body></html>`;
+
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  try {
+    await page.setContent(html, { waitUntil: "networkidle0", timeout: 30000 });
+    return Buffer.from(await page.pdf({ format: "A4", printBackground: true, margin: { top: "20px", bottom: "20px", left: "20px", right: "20px" } }));
+  } finally {
+    await page.close();
+  }
+}
+
+// PDF لسجل "استبدال معدة" (PMT/RMU) — يقابل تمامًا buildErPdf بالفرونت (html2canvas/jsPDF)، لكن عبر
+// Puppeteer بدون حيلة arabicImgTag (نفس سبب باقي دوال هذا الملف). يُستدعى تلقائيًا فور حفظ السجل لو
+// مربوط بمهمة مجدولة — انظر sendEquipmentReplacementPdf بـjobNotifications.js وroutes/equipmentReplacements.js.
+function fmtDMY(isoDate) {
+  if (!isoDate) return "";
+  const [y, mo, d] = String(isoDate).split("-");
+  if (!y || !mo || !d) return isoDate;
+  return `${parseInt(d, 10)}/${parseInt(mo, 10)}/${y}`;
+}
+export async function generateEquipmentReplacementPdfBuffer(erId) {
+  const [[er]] = await pool.query("SELECT * FROM equipment_replacements WHERE id = ?", [erId]);
+  if (!er) throw new Error("er_not_found");
+  const wh = er.issuing_warehouse_id ? (await pool.query("SELECT name FROM warehouses WHERE id = ?", [er.issuing_warehouse_id]))[0][0] : null;
+  const linkedJob = er.linked_job_id ? (await pool.query("SELECT title, notification_no FROM scheduled_jobs WHERE id = ?", [er.linked_job_id]))[0][0] : null;
+  const [images] = await pool.query("SELECT * FROM equipment_replacement_images WHERE equipment_replacement_id = ?", [erId]);
+  const before = images.filter((i) => i.image_type === "before").map((i) => i.image_url);
+  const after = images.filter((i) => i.image_type === "after").map((i) => i.image_url);
+  const row = (label, value) => (value ? `<tr><td>${esc(label)}</td><td>${esc(value)}</td></tr>` : "");
+
+  const html = `<!doctype html><html dir="rtl" lang="ar"><head><meta charset="utf-8">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Cairo:wght@400;700;800&display=swap');
+    * { box-sizing: border-box; }
+    body { font-family: 'Cairo', sans-serif; direction: rtl; text-align: right; color: #0f172a; padding: 8px 32px; }
+    h1 { text-align:center; font-size:20px; color:#1e3a5f; margin:0; }
+    .sub { text-align:center; font-size:13px; color:#64748b; margin-top:4px; }
+    .hdr { border-bottom:2px solid #1e3a5f; padding-bottom:14px; margin-bottom:18px; }
+    table.info { width:100%; border-collapse:collapse; font-size:13px; margin-bottom:18px; }
+    table.info td { padding:7px; }
+    table.info tr:nth-child(even) { background:#f8fafc; }
+    table.info td:first-child { width:150px; font-weight:700; color:#475569; }
+    .photo-title { font-size:13px; font-weight:700; color:#475569; margin:10px 0 6px; }
+    .photo-grid img { width:100%; max-width:400px; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:10px; display:block; }
+    .empty { color:#94a3b8; font-size:13px; }
+  </style></head><body>
+    <div class="hdr">
+      <h1>معلومات تغيير المعدات</h1>
+      <div class="sub">DistCtrl – نظام إدارة الأعمال والمواد</div>
+    </div>
+    <table class="info">
+      ${row("رقم المعدة", er.equipment_no)}
+      ${row("تاريخ العمل", fmtDMY(er.work_date))}
+      ${row("المقاول", er.contractor_name)}
+      ${row("الموقع", er.location)}
+      ${row("نوع المعدة", er.equipment_type)}
+      ${row("السبب", er.reason)}
+      ${row("الإشعار/المهمة", er.notification_no)}
+      ${row("رقم التاق", er.tag_no)}
+      ${row("الاستشاري", er.consultant_text)}
+      ${row("الرقم التسلسلي القديم", er.old_serial_no)}
+      ${row("الرقم التسلسلي الجديد", er.new_serial_no)}
+      ${row("سنة الصنع", er.manufacture_year)}
+      ${row("اسم الشركة المصنعة", er.manufacturer_name)}
+      ${row("جهة صرف المعدة", wh?.name)}
+      ${row("KVA", er.kva_rating)}
+      ${row("HV", er.voltage_rating)}
+      ${row("LV", er.lv_rating)}
+      ${row("طارئ؟", er.is_emergency ? "نعم" : "لا")}
+      ${linkedJob ? row("مرتبطة بمهمة", linkedJob.notification_no || linkedJob.title) : ""}
+    </table>
+    <div class="photo-title">صورة لوحة المعلومات — قبل</div>
+    <div class="photo-grid">${before.map((u) => `<img src="${esc(u)}"/>`).join("") || '<div class="empty">لا توجد صور</div>'}</div>
+    <div class="photo-title">صورة لوحة المعلومات — بعد</div>
+    <div class="photo-grid">${after.map((u) => `<img src="${esc(u)}"/>`).join("") || '<div class="empty">لا توجد صور</div>'}</div>
   </body></html>`;
 
   const browser = await getBrowser();

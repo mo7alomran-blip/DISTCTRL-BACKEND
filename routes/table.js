@@ -19,13 +19,42 @@ import express from "express";
 import { pool, genId } from "../db.js";
 import { requireAuth } from "../auth.js";
 import { policies, JOB_CHILD_TABLES } from "../policies.js";
-import { loadScopeContext } from "../scope.js";
+import { loadScopeContext, resolveDivisionForSection, OWNER_EMPLOYEE_ID } from "../scope.js";
 import { broadcastChange, REALTIME_TABLES } from "../realtime.js";
 import { notifyJobCreated, notifyJobStageChange, notifyJobChildEvent, notifyJobCompletionReport, sendJobCompletionPdf } from "../jobNotifications.js";
+import { linkOperationToJob, notifyOperationsSupervisors } from "../operationsWhatsapp.js";
+import { notifyUsersInApp } from "../appNotify.js";
 
 const router = express.Router();
 
 const FORBIDDEN_COLUMNS = new Set(["password_hash"]);
+
+// ── إصلاح أمني (فحص أمني 2026-09-18): كل أسماء الأعمدة بهذا الملف (فلاتر eq/is/in، order، أعمدة INSERT
+// من مفاتيح body، أعمدة PATCH SET من مفاتيح patch) كانت تُدخَل مباشرة بالاستعلام بين backticks بدون أي
+// تحقق أنها فعلاً أعمدة حقيقية بالجدول — أي مستخدم مسجّل دخول (بأي دور) يقدر يمرر اسم "عمود" فيه backtick
+// يكسر الاقتباس ويحقن SQL كامل (مثال مؤكَّد: ?order=id%60%2C(SELECT%20SLEEP(5))--%20-  ينتج
+// ORDER BY `id`,(SELECT SLEEP(5))-- -` ASC صالح ويُنفَّذ). الحل: قائمة بيضاء فعلية بأعمدة كل جدول من
+// information_schema، تُرفض أي عملية فيها اسم عمود غير موجود فعلاً قبل ما يدخل أي استعلام.
+const columnCache = new Map();
+async function getTableColumns(table) {
+  if (columnCache.has(table)) return columnCache.get(table);
+  const [rows] = await pool.query(
+    "SELECT COLUMN_NAME AS name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ?",
+    [table]
+  );
+  const cols = new Set(rows.map((r) => r.name));
+  columnCache.set(table, cols);
+  return cols;
+}
+class InvalidColumnError extends Error {
+  constructor(name) {
+    super(`invalid_column: ${name}`);
+    this.statusCode = 400;
+  }
+}
+function assertValidColumns(validCols, names) {
+  for (const n of names) if (!validCols.has(n)) throw new InvalidColumnError(n);
+}
 
 function stripForbidden(obj) {
   if (!obj || typeof obj !== "object") return obj;
@@ -124,6 +153,42 @@ async function loadRelatedJobs(conn, rows) {
   return new Map(jobs.map((j) => [j.id, j]));
 }
 
+// نفس منطق resolveResponsibleAdminIds بـroutes/jobActions.js بالحرف — مكرر عمدًا هنا بدل استيراده لأن
+// تلك الدالة غير مصدَّرة أصلاً (نفس القرار الموثّق هناك). مطلوب لإشعار طلب جديد "يحتاج موافقتك" بشكل
+// موثوق من الباك اند مباشرة بدل sendPushNotification بالفرونت (بلاغ المالك 2026-09-18: إشعارات لا توصل
+// خارج التطبيق لأنها تعتمد على بقاء متصفح مُقدِّم الطلب نفسه مفتوحًا لحظة الحفظ).
+async function resolveResponsibleAdminIds(warehouseId, sectionId) {
+  const [assignments] = await pool.query("SELECT * FROM warehouse_assignments");
+  const [admins] = await pool.query("SELECT id FROM users WHERE role IN ('admin','section_head','manager','operator') AND employee_id <> ?", [OWNER_EMPLOYEE_ID]);
+  if (!admins.length) return [];
+  const assignedIds = new Set(assignments.map((a) => a.user_id));
+  const openAdmins = () => admins.filter((u) => !assignedIds.has(u.id)).map((u) => u.id);
+  if (!warehouseId && !sectionId) return openAdmins();
+
+  let division = null;
+  if (warehouseId) {
+    const [[wh]] = await pool.query("SELECT division_id FROM warehouses WHERE id = ?", [warehouseId]);
+    division = wh?.division_id ?? null;
+  }
+  const newDivision = sectionId ? await resolveDivisionForSection(sectionId) : null;
+
+  const whAssignments = warehouseId ? assignments.filter((a) => a.warehouse_id === warehouseId && !a.section_id && !a.division_id) : [];
+  const secAssignments = sectionId ? assignments.filter((a) => a.section_id === sectionId) : [];
+  const divAssignments = assignments.filter((a) => a.division_id && (a.division_id === division || a.division_id === newDivision));
+
+  const narrowIds = new Set([...whAssignments, ...secAssignments].map((a) => a.user_id));
+  if (narrowIds.size > 0) {
+    const narrowAdmins = admins.filter((u) => narrowIds.has(u.id)).map((u) => u.id);
+    if (narrowAdmins.length > 0) return narrowAdmins;
+  }
+  const divIds = new Set(divAssignments.map((a) => a.user_id));
+  if (divIds.size > 0) {
+    const divAdmins = admins.filter((u) => divIds.has(u.id)).map((u) => u.id);
+    if (divAdmins.length > 0) return divAdmins;
+  }
+  return openAdmins();
+}
+
 router.get("/table/:table", requireAuth, async (req, res) => {
   const { table } = req.params;
   const tablePolicy = policies[table];
@@ -141,9 +206,12 @@ router.get("/table/:table", requireAuth, async (req, res) => {
     }
 
     const filters = parseFilters(req.query, table);
+    const validCols = await getTableColumns(table);
+    assertValidColumns(validCols, filters.map((f) => f.col));
     const { sql: whereSql, params } = buildWhere(filters);
     let orderSql = "";
     if (req.query.order) {
+      assertValidColumns(validCols, [req.query.order]);
       const dir = String(req.query.dir || "asc").toLowerCase() === "desc" ? "DESC" : "ASC";
       orderSql = ` ORDER BY \`${req.query.order}\` ${dir}`;
     }
@@ -164,6 +232,7 @@ router.get("/table/:table", requireAuth, async (req, res) => {
 
     res.json({ data: postProcessUsersRows(table, visible), error: null });
   } catch (err) {
+    if (err.statusCode === 400) return res.status(400).json({ data: null, error: err.message });
     console.error(`GET /table/${table} error:`, err);
     res.status(500).json({ data: null, error: String(err.message || err) });
   }
@@ -194,11 +263,14 @@ router.post("/table/:table", requireAuth, async (req, res) => {
 
     const isUpsert = !!req.body?.upsert;
     const onConflict = req.body?.onConflict; // اسم العمود صاحب UNIQUE constraint (يقابل .upsert(row, {onConflict}))
+    const validCols = await getTableColumns(table);
+    if (onConflict) assertValidColumns(validCols, [onConflict]);
 
     const inserted = [];
     for (const row of rowsIn) {
       const withId = row.id ? row : { id: genId(), ...row };
       const cols = Object.keys(withId);
+      assertValidColumns(validCols, cols);
       const placeholders = cols.map(() => "?").join(",");
       const values = cols.map((c) => toMySQLValue(withId[c]));
       let sql = `INSERT INTO \`${table}\` (${cols.map((c) => `\`${c}\``).join(",")}) VALUES (${placeholders})`;
@@ -214,12 +286,34 @@ router.post("/table/:table", requireAuth, async (req, res) => {
       inserted.push(fresh || withId);
     }
     if (REALTIME_TABLES.has(table)) for (const row of inserted) broadcastChange(table, "INSERT", row);
-    if (table === "scheduled_jobs") for (const row of inserted) notifyJobCreated(row, req.authUserId).catch((e) => console.error("notifyJobCreated error:", e.message || e));
+    if (table === "scheduled_jobs") for (const row of inserted) {
+      notifyJobCreated(row, req.authUserId).catch((e) => console.error("notifyJobCreated error:", e.message || e));
+      linkOperationToJob(row).catch((e) => console.error("linkOperationToJob error:", e.message || e));
+      // Push موثوق من الباك اند مباشرة — بعكس sendPushNotification بالفرونت اللي يعتمد على بقاء متصفح
+      // صاحب الإسناد نفسه مفتوحًا لحظة الحفظ (بلاغ المالك 2026-09-18: إشعارات الأعمال ما توصل خارج التطبيق)
+      if (row.employee_id) {
+        notifyUsersInApp([row.employee_id], {
+          title: "مهمة جديدة انسندت لك", body: row.title || "عمل مجدول جديد",
+          tag: `job-${row.id}`, target_screen: "job_detail", target_id: row.id,
+        }).catch((e) => console.error("notifyUsersInApp (job created) error:", e.message || e));
+      }
+    }
     if (table === "job_contractor_checks" || table === "job_isolation_notes") {
       for (const row of inserted) notifyJobChildEvent(table, row, jobsById.get(row.job_id)).catch((e) => console.error("notifyJobChildEvent error:", e.message || e));
     }
+    if (table === "orders") for (const row of inserted) {
+      resolveResponsibleAdminIds(row.warehouse_id, row.section_id).then((ids) => {
+        const targets = ids.filter((id) => id !== req.authUserId);
+        if (!targets.length) return;
+        return notifyUsersInApp(targets, {
+          title: "طلب جديد يحتاج موافقتك", body: `من ${row.emp_name || ""}`,
+          tag: `new-order-${row.id}`, target_screen: "admin_order_detail", target_id: row.id,
+        });
+      }).catch((e) => console.error("notifyUsersInApp (new order) error:", e.message || e));
+    }
     res.json({ data: postProcessUsersRows(table, inserted), error: null });
   } catch (err) {
+    if (err.statusCode === 400) return res.status(400).json({ data: null, error: err.message });
     console.error(`POST /table/${table} error:`, err);
     res.status(500).json({ data: null, error: String(err.message || err) });
   }
@@ -236,6 +330,10 @@ router.patch("/table/:table", requireAuth, async (req, res) => {
   const { sql: whereSql, params } = buildWhere(filters);
 
   try {
+    const validCols = await getTableColumns(table);
+    assertValidColumns(validCols, filters.map((f) => f.col));
+    assertValidColumns(validCols, Object.keys(patch));
+
     const [oldRows] = await pool.query(`SELECT * FROM \`${table}\` ${whereSql}`, params);
     if (!oldRows.length) return res.json({ data: [], error: null });
 
@@ -265,11 +363,27 @@ router.patch("/table/:table", requireAuth, async (req, res) => {
           notifyJobCompletionReport(fresh).catch((e) => console.error("notifyJobCompletionReport error:", e.message || e));
           sendJobCompletionPdf(fresh).catch((e) => console.error("sendJobCompletionPdf error:", e.message || e));
         }
+        if (oldRow.employee_id !== fresh.employee_id && fresh.employee_id) {
+          notifyUsersInApp([fresh.employee_id], {
+            title: "مهمة جديدة انسندت لك", body: fresh.title || "عمل مجدول جديد",
+            tag: `job-${fresh.id}`, target_screen: "job_detail", target_id: fresh.id,
+          }).catch((e) => console.error("notifyUsersInApp (job reassigned) error:", e.message || e));
+        }
+      }
+      if (table === "orders" && oldRow.status !== fresh.status && fresh.user_id && fresh.user_id !== req.authUserId) {
+        notifyUsersInApp([fresh.user_id], {
+          title: "تغيرت حالة طلبك", body: fresh.status || "",
+          tag: `order-${fresh.id}`, target_screen: "admin_order_detail", target_id: fresh.id,
+        }).catch((e) => console.error("notifyUsersInApp (order status) error:", e.message || e));
+      }
+      if (table === "operations" && oldRow.status !== fresh.status) {
+        notifyOperationsSupervisors(fresh, "status_changed", { from: oldRow.status, to: fresh.status }).catch((e) => console.error("notifyOperationsSupervisors error:", e.message || e));
       }
     }
     if (REALTIME_TABLES.has(table)) for (const row of updated) broadcastChange(table, "UPDATE", row);
     res.json({ data: postProcessUsersRows(table, updated), error: null });
   } catch (err) {
+    if (err.statusCode === 400) return res.status(400).json({ data: null, error: err.message });
     console.error(`PATCH /table/${table} error:`, err);
     res.status(500).json({ data: null, error: String(err.message || err) });
   }
@@ -285,6 +399,9 @@ router.delete("/table/:table", requireAuth, async (req, res) => {
   const { sql: whereSql, params } = buildWhere(filters);
 
   try {
+    const validCols = await getTableColumns(table);
+    assertValidColumns(validCols, filters.map((f) => f.col));
+
     const [rows] = await pool.query(`SELECT * FROM \`${table}\` ${whereSql}`, params);
     if (!rows.length) return res.json({ data: [], error: null });
 
@@ -304,6 +421,7 @@ router.delete("/table/:table", requireAuth, async (req, res) => {
     if (REALTIME_TABLES.has(table)) for (const row of deleted) broadcastChange(table, "DELETE", row);
     res.json({ data: deleted, error: null });
   } catch (err) {
+    if (err.statusCode === 400) return res.status(400).json({ data: null, error: err.message });
     console.error(`DELETE /table/${table} error:`, err);
     res.status(500).json({ data: null, error: String(err.message || err) });
   }

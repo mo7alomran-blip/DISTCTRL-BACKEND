@@ -10,13 +10,16 @@ export function isOwner(authUser) {
   return authUser?.employee_id === OWNER_EMPLOYEE_ID;
 }
 
+// "رئيس القسم" (section_head) — صلاحية جديدة مطابقة تمامًا لـ"مشرف" بكل شي (طلب صريح من المالك 2026-09-11)،
+// الفرق تنظيمي/تسموي بالواجهة فقط. isAdmin() هي البوابة الوحيدة اللي كل صلاحيات policies.js/rpc/stock.js
+// تمر منها، فتعديل سطر واحد هنا كافٍ ليصير لرئيس القسم نفس صلاحيات المشرف بالضبط بكل مكان.
 export function isAdmin(authUser) {
-  return authUser?.role === "admin";
+  return authUser?.role === "admin" || authUser?.role === "section_head";
 }
 
-// يطابق is_admin_or_viewer() الأصلية: صلاحية اطّلاع بنطاق (بدون تعديل) لمشرف/مدير/مشغل
+// يطابق is_admin_or_viewer() الأصلية: صلاحية اطّلاع بنطاق (بدون تعديل) لمشرف/رئيس قسم/مدير/مشغل
 export function isAdminOrViewer(authUser) {
-  return ["admin", "manager", "operator"].includes(authUser?.role);
+  return ["admin", "section_head", "manager", "operator"].includes(authUser?.role);
 }
 
 // يطابق منطق in_my_scope(p_warehouse_id, p_section_id) الأصلي بالضبط —

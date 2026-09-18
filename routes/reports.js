@@ -3,7 +3,7 @@
 import express from "express";
 import { pool } from "../db.js";
 import { optionalAuth, requireAuth } from "../auth.js";
-import { checkOverdueJobs, dailyBackup, rescheduleReportCron } from "../cron.js";
+import { checkOverdueJobs, dailyBackup, rescheduleReportCron, checkTodayJobs } from "../cron.js";
 import { sendDailyReport, sendPeriodicReport } from "../reportEmails.js";
 
 const router = express.Router();
@@ -17,7 +17,7 @@ async function authorizedForCron(req) {
   if (!req.authUserId) return false;
   try {
     const [[caller]] = await pool.query("SELECT role, is_active FROM users WHERE id = ?", [req.authUserId]);
-    return !!caller && caller.role === "admin" && !!caller.is_active;
+    return !!caller && (caller.role === "admin" || caller.role === "section_head") && !!caller.is_active;
   } catch {
     return false; // خطأ بقاعدة البيانات = رفض دخول افتراضيًا، أأمن من السماح
   }
@@ -27,6 +27,15 @@ router.post("/reports/check-overdue", optionalAuth, async (req, res) => {
   if (!(await authorizedForCron(req))) return res.status(401).json({ success: false, error: "unauthorized" });
   try {
     res.json(await checkOverdueJobs());
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err.message || err) });
+  }
+});
+
+router.post("/reports/check-today-jobs", optionalAuth, async (req, res) => {
+  if (!(await authorizedForCron(req))) return res.status(401).json({ success: false, error: "unauthorized" });
+  try {
+    res.json(await checkTodayJobs());
   } catch (err) {
     res.status(500).json({ success: false, error: String(err.message || err) });
   }

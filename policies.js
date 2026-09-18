@@ -132,6 +132,40 @@ export const policies = {
     delete: (authUser) => isOwner(authUser),
   },
 
+  // ── operations: وحدة "التشغيل" — سجلات مستوردة من Excel أو مُدخلة يدويًا، بنطاق دائرة الدعم/أقسامها.
+  // الكتابة (رفع/إضافة/تعديل/تغيير حالة/حذف) مقصورة على مشرف/رئيس قسم/مالك فقط (الطلب الأصلي يذكر
+  // "المشرف" بكل عملية تقريبًا) — بدون warehouse_id (الوحدة تعتمد فقط على section_id/division_id) ──
+  operations: {
+    select: (authUser, scopeCtx, row) =>
+      isOwner(authUser) ||
+      (isAdminOrViewer(authUser) && inMyScopeSync(scopeCtx, authUser, null, row.section_id)),
+    insert: (authUser, scopeCtx, newRow) =>
+      isOwner(authUser) || (isAdmin(authUser) && inMyScopeSync(scopeCtx, authUser, null, newRow.section_id)),
+    update: (authUser, scopeCtx, oldRow, newRow) =>
+      isOwner(authUser) ||
+      (isAdmin(authUser) &&
+        inMyScopeSync(scopeCtx, authUser, null, oldRow.section_id) &&
+        inMyScopeSync(scopeCtx, authUser, null, newRow.section_id)),
+    delete: (authUser, scopeCtx, row) =>
+      isOwner(authUser) || (isAdmin(authUser) && inMyScopeSync(scopeCtx, authUser, null, row.section_id)),
+  },
+
+  // ── operations_audit_log: سجل تدقيق للتشغيل — اطّلاع فقط (إداري/مالك)، الإدراج يتم داخليًا من السيرفر
+  // نفسه (routes/operations.js وroutes/table.js) — بدون insert/update/delete عبر الراوت العام مقصودًا ──
+  operations_audit_log: {
+    select: (authUser) => isOwner(authUser) || isAdminOrViewer(authUser),
+    insert: (authUser) => isOwner(authUser) || isAdmin(authUser),
+  },
+
+  // ── operations_location_rules: قواعد ربط الموقع بالقسم لوحدة التشغيل — إداري فقط للكتابة، اطّلاع عام
+  // (يحتاجها الفرونت وقت المعاينة قبل الاستيراد ليحدد القسم تلقائيًا لكل مستخدم عنده صلاحية استيراد) ──
+  operations_location_rules: {
+    select: () => true,
+    insert: (authUser) => isOwner(authUser) || isAdmin(authUser),
+    update: (authUser) => isOwner(authUser) || isAdmin(authUser),
+    delete: (authUser) => isOwner(authUser) || isAdmin(authUser),
+  },
+
   // ── orders: أعقد سياسة بالنظام — insert يتحقق من user_id بالصف الجديد، select/update/delete بنطاق ──
   orders: {
     select: (authUser, scopeCtx, row) =>
@@ -176,6 +210,8 @@ export const policies = {
     select: (authUser) => authed(authUser),
     insert: (authUser) => authed(authUser),
     update: (authUser) => authed(authUser),
+    // حذف — مقصور على صاحب الإشعار نفسه (row.user_id) — طلب صريح 2026-09-14: "إمكانية مسح الإشعارات"
+    delete: (authUser, scopeCtx, row) => isOwner(authUser) || row.user_id === authUser.sub,
   },
 
   // ── report_recipients: مالك فقط (بدون update) ──
@@ -197,11 +233,19 @@ export const policies = {
     update: (authUser) => isOwner(authUser),
   },
 
-  // ── scheduled_jobs: insert يسمح بذاتي فقط، select/update بنطاق (بدون delete — إلغاء عبر status) ──
+  // ── scheduled_jobs: insert يسمح بذاتي فقط، select/update بنطاق. delete: المالك فقط — إجراء لا رجعة
+  // فيه، لتصحيح عمل أُدخل بالخطأ (طلب صريح 2026-09-13)؛ الإلغاء العادي (حالة "ملغاة") يبقى متاح للجميع
+  // حسب نطاقهم عبر update كالمعتاد، ويُفضَّل دائمًا على الحذف لأي عمل حقيقي حصل عليه تنفيذ فعلي ──
   scheduled_jobs: {
+    delete: (authUser) => isOwner(authUser),
+    // section_id كان يُمرَّر null بالكود (بدل row.section_id) — خلل جذري حقيقي: أي عمل بدون warehouse_id
+    // (زي أعمال دائرة الإنشاءات الجديدة المربوطة بقسم فرعي مباشرة) كان يختفي كليًا من نتائج SELECT لأي
+    // غير مالك، بغض النظر عن صحة تخصيصه على القسم نفسه — inMyScopeSync أصلاً تدعم sectionId وتشتق منه
+    // الدائرة تلقائيًا (newDivisionHit)، بس هذا المسار بالذات كان يتجاهلها بالكامل. بلاغ المالك 2026-09-14:
+    // "الاعمال ماتطلع عن احمد الفضل" — حللتها "حل جذري".
     select: (authUser, scopeCtx, row) =>
       isOwner(authUser) ||
-      (isAdminOrViewer(authUser) && inMyScopeSync(scopeCtx, authUser, row.warehouse_id, null)) ||
+      (isAdminOrViewer(authUser) && inMyScopeSync(scopeCtx, authUser, row.warehouse_id, row.section_id)) ||
       row.employee_id === authUser.sub,
     insert: (authUser, scopeCtx, newRow) =>
       isOwner(authUser) || isAdmin(authUser) || newRow.employee_id === authUser.sub,
@@ -294,18 +338,42 @@ export const policies = {
     update: (authUser) => isOwner(authUser), // تعليم "تم الحل" فقط من المالك
   },
 
-  // ── job_notification_prefs: تخصيص "مين يستلم شنو" لكل قسم/مشروع — إدارة المالك فقط (انظر jobNotifications.js) ──
+  // ── job_notification_prefs: تخصيص "مين يستلم شنو" لكل قسم/مشروع — انظر resolveJobTargets بـjobNotifications.js.
+  // ذاتية الخدمة (طلب المالك 2026-09-11): أي مشرف/رئيس قسم يقدر يضيف/يعدّل صفه هو بس، وبس لقسم ضمن نطاقه —
+  // مو أي صف لأي شخص لأي قسم (هذا يبقى للمالك حصرًا). newRow.user_id/oldRow.user_id يحددان "صفه هو".
   job_notification_prefs: {
-    select: (authUser) => isOwner(authUser) || isAdmin(authUser),
-    insert: (authUser) => isOwner(authUser),
-    update: (authUser) => isOwner(authUser),
-    delete: (authUser) => isOwner(authUser),
+    select: (authUser) => isOwner(authUser) || isAdminOrViewer(authUser),
+    // isAdminOrViewer (مو isAdmin) — مدير/مشغل (view-only بصلاحيات الموافقة) يقدر يضبط استلامه الشخصي لنفسه
+    // برضه (طلب صريح من المالك 2026-09-11: زر "الإشعارات" بقائمة الموظفين يظهر لهم أيضًا)
+    insert: (authUser, scopeCtx, newRow) =>
+      isOwner(authUser) ||
+      (isAdminOrViewer(authUser) && newRow.user_id === authUser.sub && inMyScopeSync(scopeCtx, authUser, null, newRow.section_id)),
+    update: (authUser, scopeCtx, oldRow) => isOwner(authUser) || (isAdminOrViewer(authUser) && oldRow.user_id === authUser.sub),
+    delete: (authUser, scopeCtx, row) => isOwner(authUser) || (isAdminOrViewer(authUser) && row.user_id === authUser.sub),
   },
 
   // ── global_job_watchers: متابعون عامون يستلمون كل تحديث لأي عمل بكل النظام — إدارة المالك فقط ──
   global_job_watchers: {
     select: (authUser) => isOwner(authUser) || isAdmin(authUser),
     insert: (authUser) => isOwner(authUser),
+    delete: (authUser) => isOwner(authUser),
+  },
+
+  // ── employee_notification_groups: قروبات واتساب إضافية يختارها المالك/المشرف لموظف معيّن من بطاقته
+  // (تعديل بيانات الموظف) — إدارة إدارية فقط، نفس صلاحيات إدارة المستخدمين عمومًا ──
+  employee_notification_groups: {
+    select: (authUser) => isOwner(authUser) || isAdmin(authUser),
+    insert: (authUser) => isOwner(authUser) || isAdmin(authUser),
+    delete: (authUser) => isOwner(authUser) || isAdmin(authUser),
+  },
+
+  // ── whatsapp_groups: سجل مرجعي بكل قروبات واتساب المعروفة للنظام (اسمها الحقيقي بواتساب + JID) —
+  // يغذّي قائمة الاختيار بـ"توجيه رسائل أعماله" ببطاقة الموظف، بغض النظر لو القروب مربوط بمستودع/قسم أو لا.
+  // إدارة المالك فقط (تسجيل قروب جديد نادر ويدوي عبر endpoint /groups ببوت الواتساب الاحتياطي) ──
+  whatsapp_groups: {
+    select: (authUser) => isOwner(authUser) || isAdmin(authUser),
+    insert: (authUser) => isOwner(authUser),
+    update: (authUser) => isOwner(authUser),
     delete: (authUser) => isOwner(authUser),
   },
 

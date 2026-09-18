@@ -100,6 +100,10 @@ CREATE TABLE sections (
   -- استخدمنا self-reference بنفس جدول sections: قسم = division_id IS NOT NULL (تابع دائرة مباشرة)،
   -- مجموعة = parent_section_id IS NOT NULL (تابعة لقسم أب). warehouses.section_id يشير لأي منهما.
   parent_section_id CHAR(36) NULL,
+  -- whatsapp_group_id: قروب واتساب مخصص لهذي المجموعة بالذات (أدق من warehouses.whatsapp_group_id) —
+  -- أُضيف 2026-09-11 (طلب صريح من المالك: قروب حقيقي لمجموعة "الخطوط الهوائية" وحدها، منفصل عن قروب
+  -- قسمها الأوسع). resolveJobTargets بـjobNotifications.js يفحصه أولًا قبل قروب القسم — الأخص يطغى.
+  whatsapp_group_id VARCHAR(64) NULL,
   FOREIGN KEY (warehouse_id) REFERENCES warehouses(id),
   FOREIGN KEY (division_id) REFERENCES divisions(id),
   FOREIGN KEY (parent_section_id) REFERENCES sections(id)
@@ -257,6 +261,9 @@ CREATE TABLE material_catalog (
   category   VARCHAR(191) NULL COMMENT 'CLASSIFICATION OF GROUPS',
   is_active  TINYINT(1) NOT NULL DEFAULT 1,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  -- name_ar: ترجمة عربية لـname الإنجليزي الأصلي (تُملأ مرة وحدة بسكربت دفعي عبر MyMemory) — تسهّل البحث
+  -- بشاشة "طلب مواد" (الموظف يكتب عربي، النظام يطابق الاسم الإنجليزي التقني الأصلي). أُضيف لاحقًا (2026-09-10).
+  name_ar    TEXT NULL,
   UNIQUE KEY uq_material_catalog_code (code)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -469,10 +476,15 @@ CREATE TABLE orders (
   equipment_no      VARCHAR(191) NULL,
   notification_no   VARCHAR(191) NULL,
   work_type         VARCHAR(191) NULL,
+  -- job_id: طلب مواد مُنشأ من داخل عمل مجدول (زر "طلب مواد" بتفاصيل العمل) — الموظف يبحث بقائمة
+  -- material_catalog الكاملة (مو مقيّد بمخزون المستودع الفعلي)، ويصل الطلب لنفس شاشة موافقة الطلبات
+  -- العادية. NULL لأي طلب عادي (من شاشة "طلب مواد" المستقلة، مو مرتبط بعمل). أُضيف لاحقًا (2026-09-10).
+  job_id            CHAR(36) NULL,
   UNIQUE KEY uq_orders_order_no (order_no),
   FOREIGN KEY (user_id) REFERENCES users(id),
   FOREIGN KEY (warehouse_id) REFERENCES warehouses(id),
-  FOREIGN KEY (section_id) REFERENCES sections(id)
+  FOREIGN KEY (section_id) REFERENCES sections(id),
+  FOREIGN KEY (job_id) REFERENCES scheduled_jobs(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ------------------------------------------------------------------
@@ -635,18 +647,32 @@ CREATE TABLE tech_issue_reports (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- job_notification_prefs: تخصيص "مين يستلم شنو" لكل قسم/مشروع — صف لكل (قسم، شخص)، كل نوع محتوى TINYINT
--- مستقل (تحديث مراحل / تقرير نهائي نصي / PDF كامل / PDF جودة تنفيذ / PDF جودة إرفاق). قسم بلا أي صف هنا
--- يستمر بالسلوك القديم (المشرف المسؤول عن النطاق تلقائيًا) — انظر resolveJobTargets بـjobNotifications.js.
--- أُضيف لاحقًا (2026-09-07) ضمن تطوير المهام المسندة لصيانة والإنشاءات.
+-- مستقل (تحديث مراحل / تقرير نهائي نصي / PDF كامل / PDF جودة تنفيذ / PDF جودة إرفاق / طلب مواد / تصعيد تأخير).
+-- قسم بلا أي صف هنا يستمر بالسلوك القديم (المشرف المسؤول عن النطاق تلقائيًا) — انظر resolveJobTargets
+-- بـjobNotifications.js. أُضيف لاحقًا (2026-09-07) ضمن تطوير المهام المسندة لصيانة والإنشاءات.
+-- material_request/escalation أُضيفا (2026-09-11) — واجهة ذاتية الخدمة تتيح لكل مشرف/رئيس قسم يفعّل نفسه
+-- لأي نوع رسالة يبيها بنفسه بدل ما يعدَّل الجدول يدويًا بالسيرفر. تنبيه مهم: أول صف يُنشأ لأي قسم يبدّل
+-- ذاك القسم بالكامل لكل الأنواع من الخوارزمية الديناميكية لقائمة صريحة — نوع بلا أي شخص مفعَّل له
+-- بأي صف = محد يستلمه إطلاقًا (بدون أي تراجع تلقائي)، حتى لو صفوف ثانية بنفس القسم مفعّلة لأنواع غيره.
+-- job_created/job_received/job_cancelled أُضيفا (2026-09-11 أيضًا) — كانت الثلاثة مجمَّعة قبل داخل
+-- stage_updates بالحرف؛ فُصلت لطلب صريح من المالك (رئيس القسم يبي يتحكم بكل وحدة منها براسها، مثلاً
+-- يستلم "استلام العمل" بس بدون ضجيج باقي تحديثات المراحل). أي صف قديم كان stage_updates=1 قبل الفصل
+-- انضبط تلقائيًا بالثلاثة الجداد=1 وقت الترحيل عشان ما ينكسر سلوكه القائم.
 CREATE TABLE job_notification_prefs (
   id                     CHAR(36) NOT NULL PRIMARY KEY,
   section_id             CHAR(36) NOT NULL,
   user_id                CHAR(36) NOT NULL,
-  stage_updates          TINYINT(1) NOT NULL DEFAULT 1,
+  stage_updates          TINYINT(1) NOT NULL DEFAULT 0, -- كان DEFAULT 1 (بقايا التصميم القديم قبل فصل job_created/received/cancelled) —
+  -- سبّب خلل حقيقي 2026-09-11: تفعيل "إسناد عمل جديد" بس كان يخلي "تحديث المراحل" يتفعّل تلقائيًا معه بصمت لأي صف جديد
+  job_created            TINYINT(1) NOT NULL DEFAULT 0,
+  job_received           TINYINT(1) NOT NULL DEFAULT 0,
+  job_cancelled          TINYINT(1) NOT NULL DEFAULT 0,
   final_report           TINYINT(1) NOT NULL DEFAULT 0,
   completion_pdf         TINYINT(1) NOT NULL DEFAULT 0,
   quality_execution_pdf  TINYINT(1) NOT NULL DEFAULT 0,
   quality_attachment_pdf TINYINT(1) NOT NULL DEFAULT 0,
+  material_request       TINYINT(1) NOT NULL DEFAULT 0,
+  escalation             TINYINT(1) NOT NULL DEFAULT 0,
   created_at             DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   UNIQUE KEY uniq_section_user (section_id, user_id),
   FOREIGN KEY (section_id) REFERENCES sections(id),
@@ -660,6 +686,18 @@ CREATE TABLE global_job_watchers (
   id         CHAR(36) NOT NULL PRIMARY KEY,
   user_id    CHAR(36) NOT NULL UNIQUE,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- employee_notification_groups: قروبات واتساب إضافية يختارها المالك/المشرف لموظف معيّن من بطاقته (تعديل
+-- بيانات الموظف) — لو فيها صفوف لموظف، تحل محل التغطية الافتراضية (مسؤول دائرة الموظف نفسه) بجوبNotifications.js
+-- resolveEmployeeOwnAdminPhones، فتوصل رسائل أعماله لهذي القروبات دائمًا بدل التنبيه الفردي. أُضيف 2026-09-13.
+CREATE TABLE employee_notification_groups (
+  id                CHAR(36) NOT NULL PRIMARY KEY,
+  user_id           CHAR(36) NOT NULL,
+  whatsapp_group_id VARCHAR(64) NOT NULL,
+  created_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uniq_user_group (user_id, whatsapp_group_id),
   FOREIGN KEY (user_id) REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

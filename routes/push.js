@@ -1,10 +1,16 @@
-// send-push — يرسل Web Push حقيقي لمجموعة مستخدمين. أي مستخدم مسجّل دخول يقدر يستدعيها (نفس الأصل بالحرف —
-// التطبيق نفسه يقرر إرسال أي إشعار لمين ووش محتواه، بدون تقييد دور إضافي هنا).
+// send-push — يرسل Web Push حقيقي لمجموعة مستخدمين + نص واتساب موازٍ.
+// إصلاح أمني (فحص أمني 2026-09-18): كان أي مستخدم مسجّل دخول (بأي دور) يقدر يستدعيها بعنوان/نص حرّين
+// تمامًا لأي user_ids يختارهم — يفتح باب انتحال هوية النظام لإرسال رسائل تصيّد داخلية لأي موظف/المالك.
+// كل استخدامات هذا الراوت الفعلية بالتطبيق (App.jsx) هي دائمًا "موظف عادي يبلّغ مشرفه" أو "مشرف يبلّغ
+// موظف مسند له عمل" — أبدًا "موظف يبلّغ موظف آخر عشوائي". القيد هنا يطابق هذا الواقع بالضبط بدل ما يخترع
+// تقييدًا جديدًا: مشرف/مالك يقدر يرسل لأي شخص (زي الآن تمامًا)، أما مستخدم عادي فمقصور فقط على استهداف
+// حسابات إشرافية (admin/section_head/manager/operator) — يمنع استهداف موظف عادي آخر بدون ما يكسر أي مسار حقيقي.
 import express from "express";
 import webpush from "web-push";
 import "dotenv/config";
 import { pool } from "../db.js";
 import { requireAuth } from "../auth.js";
+import { isOwner, isAdmin } from "../scope.js";
 import { sendWhatsAppText, isWhatsAppConfigured } from "../whatsapp.js";
 import { sendWebPushToSubs } from "../pushSend.js";
 
@@ -23,6 +29,17 @@ router.post("/send-push", requireAuth, async (req, res) => {
     return res.status(400).json({ success: false, error: "invalid_input" });
   }
   try {
+    const authUser = { sub: req.authUserId, role: req.authRole, employee_id: req.authEmployeeId };
+    if (!isOwner(authUser) && !isAdmin(authUser)) {
+      const [targets] = await pool.query(
+        `SELECT id, role FROM users WHERE id IN (${user_ids.map(() => "?").join(",")})`,
+        user_ids
+      );
+      const nonSupervisor = targets.find((u) => !["admin", "section_head", "manager", "operator"].includes(u.role));
+      if (nonSupervisor || targets.length !== user_ids.length) {
+        return res.status(403).json({ success: false, error: "forbidden_target" });
+      }
+    }
     const [subs] = await pool.query(
       `SELECT id, endpoint, p256dh, auth_key FROM push_subscriptions WHERE user_id IN (${user_ids.map(() => "?").join(",")})`,
       user_ids
